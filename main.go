@@ -33,6 +33,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sort"
 	"time"
 )
 
@@ -296,8 +297,13 @@ func cmdStats(configPath string) {
 	fmt.Printf("denies:  %d\n", denies)
 	if len(hits) > 0 {
 		fmt.Println("hits:")
-		for rule, count := range hits {
-			fmt.Printf("  %-24s %d\n", rule, count)
+		rules := make([]string, 0, len(hits))
+		for rule := range hits {
+			rules = append(rules, rule)
+		}
+		sort.Strings(rules)
+		for _, rule := range rules {
+			fmt.Printf("  %-24s %d\n", rule, hits[rule])
 		}
 	}
 }

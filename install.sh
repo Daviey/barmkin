@@ -43,14 +43,22 @@ else
 fi
 
 install_claude() {
+  command -v jq >/dev/null 2>&1 || { echo "[barmkin] error: jq is required (brew install jq / apt install jq)"; exit 1; }
+
   local settings="$HOME/.claude/settings.json"
   mkdir -p "$(dirname "$settings")"
   [[ -f "$settings" ]] || echo '{}' > "$settings"
 
   local tmp; tmp=$(mktemp)
+  # Merge: remove any existing barmkin entry by command path, then append.
+  # This preserves other PreToolUse hooks instead of overwriting them.
   jq --arg bin "$LOCAL_BIN/barmkin" '
     .hooks = ((.hooks // {}) |
-      .PreToolUse = [{"matcher":"*","hooks":[{"type":"command","command":$bin}]}]
+      .PreToolUse = (
+        (.PreToolUse // [])
+        | map(select(.hooks[0].command != $bin))
+        + [{"matcher":"*","hooks":[{"type":"command","command":$bin}]}]
+      )
     )
   ' "$settings" > "$tmp" && mv "$tmp" "$settings"
   echo "[barmkin] Claude Code: PreToolUse hook installed"

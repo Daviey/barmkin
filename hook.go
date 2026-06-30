@@ -65,7 +65,14 @@ func (r *Request) normalize() {
 		r.TrajectoryID = r.SessionID
 	}
 	if r.AgentID == "" {
-		r.AgentID = "claude-code"
+		// Infer agent from wire format: Claude Code uses tool_name/session_id;
+		// opencode uses trajectory_id/args. Default to opencode when neither
+		// Claude Code field is present.
+		if r.ToolName != "" || r.SessionID != "" {
+			r.AgentID = "claude-code"
+		} else {
+			r.AgentID = "opencode"
+		}
 	}
 }
 

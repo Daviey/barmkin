@@ -74,6 +74,8 @@ function toolArgs(tool: string, a: Record<string, unknown>): Record<string, unkn
 // Spawn `barmkin eval`, pipe the AdapterRequest JSON to stdin,
 // and check the exit code.
 
+const EVAL_TIMEOUT_MS = 3000
+
 async function evaluate(
   tool: string,
   args: Record<string, unknown>,
@@ -100,7 +102,17 @@ async function evaluate(
     proc.stdin.write(req)
     proc.stdin.end()
 
-    const code = await proc.exited
+    // Race the exit against a timeout. On timeout, kill the process and
+    // fail open so a hung binary never blocks a tool call indefinitely.
+    const code = await Promise.race<number | null>([
+      proc.exited,
+      new Promise<null>((resolve) => setTimeout(() => resolve(null), EVAL_TIMEOUT_MS)),
+    ])
+
+    if (code === null) {
+      try { proc.kill() } catch {}
+      return null // timeout - fail open
+    }
 
     // Exit 2 = deny. Read stderr for the reason.
     if (code === 2) {
