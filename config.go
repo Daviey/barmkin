@@ -4,6 +4,7 @@
 //   - rules:   list of regex rules with name, pattern, action, reason, example
 //   - otel:    optional OpenTelemetry OTLP endpoint
 //   - log:     optional JSON-lines audit log path
+//   - classifier: optional System One classifier, shadow mode only (off unless enabled)
 //
 // Config lookup order (first existing file wins):
 //   1. $BARMKIN_CONFIG
@@ -13,10 +14,15 @@
 package main
 
 import (
+	"errors"
 	"fmt"
+	"net"
+	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
+	"sort"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -24,9 +30,10 @@ import (
 
 // Config is the top-level YAML structure.
 type Config struct {
-	Rules []Rule `yaml:"rules"`
-	OTel  OTel   `yaml:"otel"`
-	Log   Log    `yaml:"log"`
+	Rules      []Rule     `yaml:"rules"`
+	OTel       OTel       `yaml:"otel"`
+	Log        Log        `yaml:"log"`
+	Classifier Classifier `yaml:"classifier"` // optional; absent or disabled == regex only
 }
 
 // Rule defines a single guardrail pattern.
@@ -48,6 +55,203 @@ type OTel struct {
 // Log configures the optional JSON-lines audit log.
 type Log struct {
 	Path string `yaml:"path"` // expanded with ~ → $HOME
+}
+
+// Classifier configures the optional System One classifier (shadow.go,
+// classifier.go). It only sees calls the regex rules already allowed,
+// and in shadow mode - the only mode - it records what the classifier
+// would have decided without ever changing the decision.
+type Classifier struct {
+	Enabled bool   `yaml:"enabled"` // master switch; absent block == false
+	Mode    string `yaml:"mode"`    // "shadow" (default, and the only supported mode)
+
+	BaseURL       string `yaml:"base_url"`       // http(s) URL; requests go to POST {base_url}/v1/systemone
+	Model         string `yaml:"model"`          // model id sent with every request
+	ResponseModel string `yaml:"response_model"` // optional regex the response's model must match (default: exactly model)
+	TimeoutMs     int    `yaml:"timeout_ms"`     // deadline for the whole request (default 1500)
+	Redact        *bool  `yaml:"redact"`         // mask secrets in the command before sending (default true)
+
+	Tools           []string `yaml:"tools"`            // normalized tool names to classify (default ["bash"])
+	PermissionModes []string `yaml:"permission_modes"` // Claude Code permission_mode values to classify (default: all)
+	SkipReadOnly    bool     `yaml:"skip_read_only"`   // skip commands made only of known read-only segments
+	SkipAllowRules  bool     `yaml:"skip_allow_rules"` // skip commands an explicit allow rule matched
+
+	Thresholds map[string]float64 `yaml:"thresholds"` // per-question reject-at override, keyed by question id
+	Breaker    Breaker            `yaml:"breaker"`
+
+	forcedOff     bool           // enabled in config, turned off by BARMKIN_CLASSIFIER=off
+	err           error          // decode or validation error; disables the classifier only
+	responseModel *regexp.Regexp // compiled ResponseModel
+}
+
+// Breaker is the per-session circuit breaker that stops paying the
+// request timeout on every call while the endpoint is unavailable.
+type Breaker struct {
+	OpenAfterFailures int `yaml:"open_after_failures"` // consecutive failures that open it (default 1)
+	CooldownS         int `yaml:"cooldown_s"`          // seconds before the next probe (default 60)
+}
+
+// UnmarshalYAML decodes the classifier block strictly: an unknown or
+// mistyped key is a classifier error rather than a silently ignored
+// setting. It never fails the whole config, so a broken classifier
+// block can't take the regex rules down with it.
+func (c *Classifier) UnmarshalYAML(n *yaml.Node) error {
+	type plain Classifier
+	errs := unknownKeys(n, reflect.TypeOf(plain{}), "")
+	if err := n.Decode((*plain)(c)); err != nil {
+		var te *yaml.TypeError
+		if errors.As(err, &te) {
+			for _, msg := range te.Errors {
+				errs = append(errs, errors.New(msg))
+			}
+		} else {
+			errs = append(errs, err)
+		}
+	}
+	c.err = errors.Join(errs...)
+	return nil
+}
+
+// unknownKeys reports each key of mapping node n that isn't a yaml
+// field of struct type t, recursing into struct-typed fields.
+func unknownKeys(n *yaml.Node, t reflect.Type, prefix string) []error {
+	if n.Kind != yaml.MappingNode {
+		return nil
+	}
+	var errs []error
+	for i := 0; i+1 < len(n.Content); i += 2 {
+		key, val := n.Content[i], n.Content[i+1]
+		found := false
+		for j := 0; j < t.NumField(); j++ {
+			f := t.Field(j)
+			if f.IsExported() && strings.Split(f.Tag.Get("yaml"), ",")[0] == key.Value {
+				found = true
+				if f.Type.Kind() == reflect.Struct {
+					errs = append(errs, unknownKeys(val, f.Type, prefix+key.Value+".")...)
+				}
+				break
+			}
+		}
+		if !found {
+			errs = append(errs, fmt.Errorf("line %d: unknown key %q", key.Line, prefix+key.Value))
+		}
+	}
+	return errs
+}
+
+// active reports whether the classifier should run at all.
+func (c *Classifier) active() bool {
+	return c.Enabled && c.err == nil
+}
+
+// prepare applies defaults to an enabled classifier block and validates
+// it, adding any problem to c.err. BARMKIN_CLASSIFIER=off turns the
+// classifier off; no environment value can turn it on.
+func (c *Classifier) prepare() {
+	if c.Enabled && os.Getenv("BARMKIN_CLASSIFIER") == "off" {
+		c.Enabled, c.forcedOff = false, true
+	}
+	if !c.Enabled {
+		return
+	}
+	if c.Mode == "" {
+		c.Mode = "shadow"
+	}
+	if c.TimeoutMs == 0 {
+		c.TimeoutMs = 1500
+	}
+	if c.Redact == nil {
+		on := true
+		c.Redact = &on
+	}
+	if len(c.Tools) == 0 {
+		c.Tools = []string{"bash"}
+	}
+	if c.Breaker.OpenAfterFailures == 0 {
+		c.Breaker.OpenAfterFailures = 1
+	}
+	if c.Breaker.CooldownS == 0 {
+		c.Breaker.CooldownS = 60
+	}
+
+	errs := []error{c.err}
+	if c.Mode != "shadow" {
+		errs = append(errs, fmt.Errorf("mode %q is not supported (only \"shadow\")", c.Mode))
+	}
+	if u, err := url.Parse(c.BaseURL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		errs = append(errs, fmt.Errorf("base_url %q must be an http:// or https:// URL", c.BaseURL))
+	}
+	if c.Model == "" {
+		errs = append(errs, errors.New("model is required"))
+	}
+	if c.ResponseModel != "" {
+		re, err := regexp.Compile(c.ResponseModel)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("response_model: %w", err))
+		}
+		c.responseModel = re
+	}
+	if c.TimeoutMs < 0 {
+		errs = append(errs, fmt.Errorf("timeout_ms %d must not be negative", c.TimeoutMs))
+	}
+	ids := make([]string, 0, len(c.Thresholds))
+	for id := range c.Thresholds {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		if t := c.Thresholds[id]; !knownQuestion(id) {
+			errs = append(errs, fmt.Errorf("thresholds: unknown question %q", id))
+		} else if t < 0 || t > 1 {
+			errs = append(errs, fmt.Errorf("thresholds: %s=%v must be between 0 and 1", id, t))
+		}
+	}
+	if c.Breaker.OpenAfterFailures < 0 || c.Breaker.CooldownS < 0 {
+		errs = append(errs, errors.New("breaker: values must not be negative"))
+	}
+	if _, err := questionWording(); err != nil {
+		errs = append(errs, err)
+	}
+	c.err = errors.Join(errs...)
+}
+
+// classifierStatus returns a human-readable classifier status for `barmkin validate`.
+func classifierStatus(c Classifier) string {
+	switch {
+	case c.err != nil:
+		return "invalid (disabled)"
+	case c.forcedOff:
+		return "disabled by BARMKIN_CLASSIFIER=off"
+	case !c.Enabled:
+		return "disabled"
+	}
+	baseURL := c.BaseURL
+	if u, err := url.Parse(c.BaseURL); err == nil {
+		baseURL = u.Redacted()
+	}
+	return fmt.Sprintf("%s (%s, model=%s, timeout=%dms, redact=%t)",
+		c.Mode, baseURL, c.Model, c.TimeoutMs, *c.Redact)
+}
+
+// warnings lists what `barmkin validate` should flag in an enabled,
+// valid block.
+func (c Classifier) warnings() []string {
+	if !c.Enabled || c.err != nil {
+		return nil
+	}
+	var warns []string
+	if u, _ := url.Parse(c.BaseURL); u.Scheme == "http" && !isLoopback(u.Hostname()) {
+		warns = append(warns, "base_url is plain http to a non-local host: the command travels unencrypted")
+	}
+	return warns
+}
+
+func isLoopback(host string) bool {
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // compile validates the regex pattern and defaults Action to "deny".
@@ -80,6 +284,7 @@ func loadConfig(path string) (*Config, error) {
 			return nil, fmt.Errorf("rule %q: %w", cfg.Rules[i].Name, err)
 		}
 	}
+	cfg.Classifier.prepare()
 	return &cfg, nil
 }
 
